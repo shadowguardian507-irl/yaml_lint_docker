@@ -1,0 +1,2 @@
+FROM centos:8.2.2004
+RUN yum install -y epel-release && yum install -y yamllint
