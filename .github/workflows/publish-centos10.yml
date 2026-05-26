@@ -1,0 +1,267 @@
+name: Publish CentOS 10 image
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - centos10/**
+      - .github/workflows/publish-centos10.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-centos10
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare tags
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+      DOCKERFILE: centos10/dockerfile
+    outputs:
+      base-image-ref: ${{ steps.tags.outputs.base-image-ref }}
+      build-epoch: ${{ steps.tags.outputs.build-epoch }}
+      immutable-image-tag: ${{ steps.tags.outputs.immutable-image-tag }}
+      latest-family-image-tag: ${{ steps.tags.outputs.latest-family-image-tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Validate publish configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${DOCKERHUB_IMAGE:-}" ]; then
+            echo "DOCKERHUB_IMAGE repository variable is required, for example: repouser/yaml_lint_docker" >&2
+            exit 1
+          fi
+
+          case "$DOCKERHUB_IMAGE" in
+            *[A-Z]*|*:*|*" "*|*//*|/*|*/)
+              echo "DOCKERHUB_IMAGE must be a lowercase Docker Hub repository without a tag." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Derive image tags from Dockerfile
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_ref="$(awk 'tolower($1) == "from" { print $2; exit }' "$DOCKERFILE")"
+
+          if [ -z "$base_ref" ]; then
+            echo "Unable to find a FROM line in $DOCKERFILE." >&2
+            exit 1
+          fi
+
+          base_tag="${base_ref##*:}"
+
+          if [ "$base_tag" = "$base_ref" ]; then
+            echo "The base image must use an explicit tag, got: $base_ref" >&2
+            exit 1
+          fi
+
+          case "$base_tag" in
+            stream[0-9]*)
+              centos_major="${base_tag#stream}"
+              centos_version_tag="centos-${base_tag}"
+              ;;
+            [0-9]*)
+              centos_major="${base_tag%%.*}"
+              centos_version_tag="centos-${base_tag}"
+              ;;
+            *)
+              echo "Unsupported CentOS base tag: $base_tag" >&2
+              exit 1
+              ;;
+          esac
+
+          case "$centos_major" in
+            *[!0-9]*|"")
+              echo "Unable to derive CentOS major version from base tag: $base_tag" >&2
+              exit 1
+              ;;
+          esac
+
+          build_epoch="$(date -u +%s)"
+
+          {
+            echo "base-image-ref=$base_ref"
+            echo "build-epoch=$build_epoch"
+            echo "immutable-image-tag=${DOCKERHUB_IMAGE}:${centos_version_tag}-${build_epoch}"
+            echo "latest-family-image-tag=${DOCKERHUB_IMAGE}:${centos_version_tag}-latest"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and push ${{ matrix.arch }}
+    needs:
+      - prepare
+    runs-on: ${{ matrix.runner }}
+    environment: dockerhub-production
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    env:
+      DOCKERFILE: centos10/dockerfile
+      BASE_IMAGE_REF: ${{ needs.prepare.outputs.base-image-ref }}
+      BUILD_EPOCH: ${{ needs.prepare.outputs.build-epoch }}
+      LOCAL_IMAGE_TAG: ${{ vars.DOCKERHUB_IMAGE }}:build-${{ github.sha }}-${{ matrix.arch }}
+      IMMUTABLE_ARCH_IMAGE_TAG: ${{ needs.prepare.outputs.immutable-image-tag }}-${{ matrix.arch }}
+      LATEST_ARCH_IMAGE_TAG: ${{ needs.prepare.outputs.latest-family-image-tag }}-${{ matrix.arch }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Build image without shared cache
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker build \
+            --pull \
+            --no-cache \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.created=$(date -u -d "@${BUILD_EPOCH}" +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "org.opencontainers.image.base.name=${BASE_IMAGE_REF}" \
+            --platform "linux/${{ matrix.arch }}" \
+            -f "$DOCKERFILE" \
+            -t "$LOCAL_IMAGE_TAG" \
+            .
+
+      - name: Smoke test image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker run --rm "$LOCAL_IMAGE_TAG" yamllint --version
+
+      - name: Apply publish tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker tag "$LOCAL_IMAGE_TAG" "$IMMUTABLE_ARCH_IMAGE_TAG"
+          docker tag "$LOCAL_IMAGE_TAG" "$LATEST_ARCH_IMAGE_TAG"
+
+      - name: Login to Docker Hub
+        shell: bash
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${DOCKERHUB_USERNAME:-}" ]; then
+            echo "DOCKERHUB_USERNAME secret is required." >&2
+            exit 1
+          fi
+
+          if [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "DOCKERHUB_TOKEN secret is required." >&2
+            exit 1
+          fi
+
+          printf '%s' "$DOCKERHUB_TOKEN" \
+            | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+
+      - name: Push image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker push "$IMMUTABLE_ARCH_IMAGE_TAG"
+          docker push "$LATEST_ARCH_IMAGE_TAG"
+
+      - name: Logout from Docker Hub
+        if: always()
+        shell: bash
+        run: docker logout
+
+  manifest:
+    name: Publish multi-arch manifests
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-24.04
+    environment: dockerhub-production
+    timeout-minutes: 15
+
+    env:
+      IMMUTABLE_IMAGE_TAG: ${{ needs.prepare.outputs.immutable-image-tag }}
+      LATEST_FAMILY_IMAGE_TAG: ${{ needs.prepare.outputs.latest-family-image-tag }}
+
+    steps:
+      - name: Login to Docker Hub
+        shell: bash
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${DOCKERHUB_USERNAME:-}" ]; then
+            echo "DOCKERHUB_USERNAME secret is required." >&2
+            exit 1
+          fi
+
+          if [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "DOCKERHUB_TOKEN secret is required." >&2
+            exit 1
+          fi
+
+          printf '%s' "$DOCKERHUB_TOKEN" \
+            | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+
+      - name: Create and push immutable manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker manifest create "$IMMUTABLE_IMAGE_TAG" \
+            "${IMMUTABLE_IMAGE_TAG}-amd64" \
+            "${IMMUTABLE_IMAGE_TAG}-arm64"
+          docker manifest annotate "$IMMUTABLE_IMAGE_TAG" "${IMMUTABLE_IMAGE_TAG}-amd64" --os linux --arch amd64
+          docker manifest annotate "$IMMUTABLE_IMAGE_TAG" "${IMMUTABLE_IMAGE_TAG}-arm64" --os linux --arch arm64
+          docker manifest push "$IMMUTABLE_IMAGE_TAG"
+
+      - name: Create and push latest manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker manifest create "$LATEST_FAMILY_IMAGE_TAG" \
+            "${LATEST_FAMILY_IMAGE_TAG}-amd64" \
+            "${LATEST_FAMILY_IMAGE_TAG}-arm64"
+          docker manifest annotate "$LATEST_FAMILY_IMAGE_TAG" "${LATEST_FAMILY_IMAGE_TAG}-amd64" --os linux --arch amd64
+          docker manifest annotate "$LATEST_FAMILY_IMAGE_TAG" "${LATEST_FAMILY_IMAGE_TAG}-arm64" --os linux --arch arm64
+          docker manifest push "$LATEST_FAMILY_IMAGE_TAG"
+
+      - name: Logout from Docker Hub
+        if: always()
+        shell: bash
+        run: docker logout

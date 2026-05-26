@@ -1,0 +1,6 @@
+FROM quay.io/centos/centos:stream10
+
+RUN dnf install -y epel-release \
+    && crb enable \
+    && dnf install -y yamllint \
+    && dnf clean all
